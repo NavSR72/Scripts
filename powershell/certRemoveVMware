@@ -1,0 +1,114 @@
+<#
+.SYNOPSIS
+    Example PowerShell automation script for cleaning up expired certificates
+    from multiple remote Windows servers using VMware PowerCLI.
+
+.DESCRIPTION
+    This demo script reads a list of server names, connects to each virtual
+    machine, and removes expired certificates issued by a specific issuer name
+    from the LocalMachine\My store.
+
+    It demonstrates:
+    - Reading input from files
+    - Using PowerCLI (Get-VM / Invoke-VMScript)
+    - Securely executing remote PowerShell inside guest OS
+    - Logging automation results
+
+.DISCLAIMER
+    This script is provided for learning and demonstration purposes only.
+    It contains no proprietary or confidential data and is not derived from
+    any production environment.
+#>
+
+# ------------------ CONFIGURATION ------------------
+$BasePath    = "C:\Automation\CertCleanup"
+$ServersFile = "$BasePath\servers.txt"
+$LogFile     = "$BasePath\deleted_certs_log.txt"
+
+# Certificate search parameters
+$IssuerName     = "ExampleIssuer"
+$StoreLocation  = "LocalMachine"
+$StoreName      = "My"
+
+# ------------------ VALIDATION ------------------
+if (-not (Test-Path $ServersFile)) {
+    Write-Error "Server list file not found: $ServersFile"
+    exit 1
+}
+
+# ------------------ MAIN PROCESS ------------------
+$Servers = Get-Content -Path $ServersFile
+Write-Host "Starting certificate cleanup for $($Servers.Count) servers..." -ForegroundColor Cyan
+
+foreach ($Server in $Servers) {
+    Write-Host "`nProcessing server: $Server" -ForegroundColor Yellow
+
+    try {
+        # Get the VM object (requires VMware PowerCLI)
+        $VM = Get-VM -Name $Server -ErrorAction Stop
+        Write-Host "Found VM: $($VM.Name)"
+
+        if ($VM.PowerState -ne "PoweredOn") {
+            Write-Warning "VM $Server is not powered on. Skipping..."
+            continue
+        }
+
+        # ------------------ REMOTE SCRIPT ------------------
+$RemoteScript = @"
+`$store = New-Object System.Security.Cryptography.X509Certificates.X509Store('$StoreName', '$StoreLocation')
+`$store.Open('ReadWrite')
+
+try {
+    `$expiredCerts = `$store.Certificates | Where-Object {
+        `$_.Issuer -like '*$IssuerName*' -and `$_.NotAfter -lt (Get-Date)
+    }
+
+    if (-not `$expiredCerts -or `$expiredCerts.Count -eq 0) {
+        Write-Output "No expired certificates found for issuer '$IssuerName' on `$env:COMPUTERNAME."
+    } else {
+        foreach (`$cert in `$expiredCerts) {
+            `$san = 'N/A'
+            try {
+                `$ext = `$cert.Extensions | Where-Object { `$_.Oid.FriendlyName -eq 'Subject Alternative Name' }
+                if (`$ext.Count -gt 0) {
+                    `$san = `$ext[0].Format(`$false)
+                }
+            } catch {}
+
+            Write-Output "REMOVED | Server=`$env:COMPUTERNAME | Thumbprint=`$(`$cert.Thumbprint) | Subject=`$(`$cert.Subject) | Issuer=`$(`$cert.Issuer) | ValidFrom=`$(`$cert.NotBefore) | ValidTo=`$(`$cert.NotAfter) | SANs=`$san"
+
+            try {
+                `$store.Remove(`$cert)
+            } catch {
+                Write-Output "Failed to remove `$(`$cert.Thumbprint): `$_"
+            }
+        }
+    }
+}
+finally {
+    `$store.Close()
+}
+"@
+
+        # Execute the script remotely
+        $Result = Invoke-VMScript -VM $VM -ScriptText $RemoteScript -ScriptType PowerShell -ErrorAction Stop
+
+        if ($Result.ExitCode -eq 0) {
+            Write-Host "Success on $Server" -ForegroundColor Green
+            $Result.ScriptOutput -split "`n" | ForEach-Object {
+                if ($_ -like "REMOVED*") {
+                    Add-Content -Path $LogFile -Value $_
+                }
+            }
+        } else {
+            Write-Warning "Script failed on $Server (exit code: $($Result.ExitCode))"
+            if ($Result.ScriptOutput) { Write-Warning "Output: $($Result.ScriptOutput)" }
+            if ($Result.ScriptError) { Write-Warning "Error: $($Result.ScriptError)" }
+        }
+    }
+    catch {
+        Write-Warning "Failed to process $Server. Error: $($_.Exception.Message)"
+    }
+}
+
+Write-Host "`nCertificate cleanup completed. Log saved to $LogFile" -ForegroundColor Cyan
