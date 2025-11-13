@@ -1,0 +1,74 @@
+# This script collects software, service, and disk inventory data 
+# from a list of Windows VMs and stores them centrally before upgrade.
+# (All environment-specific values have been sanitized)
+
+# Path to input server list
+$serversFile = "C:\Scripts\Input_Servers.txt"
+$vmNames = Get-Content $serversFile
+
+# Define storage server and destination folder for collected data
+$StorageServer = "inventory-storage"
+$BaseLocalFolder = "\\$StorageServer\Shared\VM_Inventory\"
+
+foreach ($vmName in $vmNames) {
+    Write-Host "Processing VM: $vmName"
+
+    # Check if VM is reachable
+    if (!(Test-Connection -ComputerName $vmName -Count 2 -Quiet)) {
+        Write-Host "Warning: VM '$vmName' is not reachable. Skipping..."
+        continue
+    }
+
+    # Define per-VM storage paths
+    $LocalFolder = "$BaseLocalFolder\$vmName\BeforeUpgrade\"
+    $LocalSoftwareFile = "$LocalFolder\Installed_Software_$vmName.csv"
+    $LocalServicesFile = "$LocalFolder\Services_$vmName.csv"
+    $LocalVolumeInfoFile = "$LocalFolder\DiskInfo_$vmName.csv"
+
+    # Create folder if missing
+    if (!(Test-Path $LocalFolder)) {
+        New-Item -ItemType Directory -Path $LocalFolder -Force | Out-Null
+    }
+
+    # Remote script to collect system information
+    $remoteScript = @'
+$FolderPath = "C:\VM_Inventory"
+$SoftwareFile = "$FolderPath\Installed_Software.csv"
+$ServicesFile = "$FolderPath\Services.csv"
+$VolumeInfoFile = "$FolderPath\DiskInfo.csv"
+
+if (!(Test-Path $FolderPath)) {
+    New-Item -ItemType Directory -Path $FolderPath -Force | Out-Null
+}
+
+# Collect installed software
+Get-WmiObject -Class Win32_Product | 
+    Select-Object Name, Vendor, Version, InstallDate | 
+    Export-Csv -Path $SoftwareFile -NoTypeInformation -Encoding UTF8
+
+# Collect running services
+Get-CimInstance -ClassName Win32_Service | 
+    Select-Object DisplayName, Name, 
+                  @{Name="Status"; Expression={$_.State}}, 
+                  @{Name="StartType"; Expression={$_.StartMode}}, 
+                  StartName | 
+    Export-Csv -Path $ServicesFile -NoTypeInformation -Encoding UTF8
+
+# Collect disk volume information
+Get-Volume | 
+    Select-Object DriveLetter, FileSystemLabel, FileSystem, HealthStatus, OperationalStatus,
+                  @{Name="Size(GB)"; Expression={[math]::Round($_.Size / 1GB, 2)}},
+                  @{Name="SizeRemaining(GB)"; Expression={[math]::Round($_.SizeRemaining / 1GB, 2)}} | 
+    Export-Csv -Path $VolumeInfoFile -NoTypeInformation -Encoding UTF8
+'@
+
+    # Execute the remote script and copy results
+    Invoke-VMScript -VM $vmName -ScriptText $remoteScript -ScriptType PowerShell
+    Copy-Item "\\$vmName\C$\VM_Inventory\Installed_Software.csv" $LocalSoftwareFile
+    Copy-Item "\\$vmName\C$\VM_Inventory\Services.csv" $LocalServicesFile
+    Copy-Item "\\$vmName\C$\VM_Inventory\DiskInfo.csv" $LocalVolumeInfoFile
+
+    Write-Host "Files for VM $vmName saved to: $LocalFolder"
+}
+
+Write-Host "Processing complete for all VMs."
